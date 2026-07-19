@@ -1,5 +1,5 @@
 #![allow(unused_imports, clippy::enum_variant_names)]
-use std::env::{split_paths, var};
+use std::env::{self, split_paths, var};
 use std::fs::Metadata;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -9,7 +9,7 @@ use cmd::{BUILT_IN_COMMANDS, Command};
 
 fn main() {
     loop {
-        print!("$ ");
+        print!("{} $ ", Command::pwd_direc());
         io::stdout().flush().unwrap();
 
         //command
@@ -19,6 +19,12 @@ fn main() {
 
         match command {
             Command::ExitCommand => break,
+            Command::PwdCommand => println!("{}", Command::pwd_direc()),
+            Command::CdCommand { directory } => {
+                if let Err(e) = Command::change_directory(directory.name) {
+                    eprintln!("{}", e)
+                }
+            }
             Command::EchoCommand { display_string } => println!("{}", display_string.name),
             Command::TypeCommand { command_name } => {
                 let mut flag = false;

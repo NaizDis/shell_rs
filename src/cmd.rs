@@ -1,15 +1,17 @@
 #![allow(unused_imports, clippy::enum_variant_names)]
 use anyhow::{Context, anyhow};
-use std::env::{split_paths, var};
+use std::env::{self, split_paths, var};
 use std::fs::Metadata;
 use std::os::unix::fs::PermissionsExt;
-use std::path;
+use std::path::{self, Path};
 use std::process::Stdio;
 use std::sync::mpsc::Receiver;
 
-pub const BUILT_IN_COMMANDS: [&str; 3] = ["echo", "type", "exit"];
+pub const BUILT_IN_COMMANDS: [&str; 4] = ["echo", "type", "exit", "pwd"];
 pub enum Command {
     ExitCommand,
+    PwdCommand,
+    CdCommand { directory: exeCmd },
     EchoCommand { display_string: exeCmd },
     TypeCommand { command_name: exeCmd },
     ExecCommand { exec_name: exeCmd },
@@ -18,36 +20,53 @@ pub enum Command {
 impl Command {
     pub fn from_input(input: &str) -> Self {
         let input = input.trim();
-        if input == "exit" {
-            return Self::ExitCommand;
-        };
-        if input.starts_with("echo ") {
-            return Command::EchoCommand {
+        let parts: Vec<&str> = input.splitn(2, ' ').collect();
+        let cmd = parts[0];
+        let args = parts.get(1).copied().unwrap_or("");
+
+        match cmd {
+            "exit" => Command::ExitCommand,
+            "echo" => Command::EchoCommand {
                 display_string: exeCmd {
-                    name: input[5..].to_string(),
+                    name: args.to_string(),
                     path: None,
                     args: vec![],
                 },
-            };
-        }
-        if input.starts_with("type ") {
-            let parse = if let Ok(parseInput) = Self::parse_input(&input[5..]) {
-                parseInput
-            } else {
-                exeCmd {
-                    name: input[5..].to_string(),
-                    path: None,
-                    args: vec![],
+            },
+            "type" => {
+                let parse = if let Ok(p) = Command::parse_input(args) {
+                    p
+                } else {
+                    exeCmd {
+                        name: args.to_string(),
+                        path: None,
+                        args: vec![],
+                    }
+                };
+                Command::TypeCommand {
+                    command_name: parse,
                 }
-            };
-            return Command::TypeCommand {
-                command_name: parse,
-            };
-        }
-        if let Ok(data) = Self::parse_input(input) {
-            Command::ExecCommand { exec_name: data }
-        } else {
-            Command::CommandNotFound
+            }
+            "pwd" => Command::PwdCommand,
+            "cd" => {
+                let parse = if let Ok(p) = Command::parse_input(args) {
+                    p
+                } else {
+                    exeCmd {
+                        name: args.to_string(),
+                        path: None,
+                        args: vec![],
+                    }
+                };
+                Command::CdCommand { directory: parse }
+            }
+            _ => {
+                if let Ok(data) = Command::parse_input(input) {
+                    Command::ExecCommand { exec_name: data }
+                } else {
+                    Command::CommandNotFound
+                }
+            }
         }
     }
 
@@ -63,16 +82,18 @@ impl Command {
             .iter()
             .map(|s| s.to_owned().to_owned())
             .collect();
-        let ptt = if let Ok(path) = Self::get_path_exe(cmd_name) {
-            Some(path)
-        } else {
-            None
-        };
+        let pta = Self::get_path_exe(cmd_name)?;
         Ok(exeCmd {
             name: cmd_name.to_string(),
             args: arggs,
-            path: ptt,
+            path: Some(pta),
         })
+    }
+
+    pub fn pwd_direc() -> String {
+        env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "?/?".to_string())
     }
 
     fn get_path_exe(name: &str) -> anyhow::Result<String> {
@@ -86,6 +107,22 @@ impl Command {
             }
         }
         Err(anyhow!("Path Not Found"))
+    }
+
+    pub fn change_directory(dir: String) -> anyhow::Result<i32> {
+        let mut og_pt = dir;
+        if og_pt == "~" {
+            og_pt = env::home_dir().unwrap().to_string_lossy().into_owned();
+        }
+        let path = Path::new(&og_pt);
+        if env::set_current_dir(path).is_ok() {
+            Ok(0)
+        } else {
+            Err(anyhow!(
+                "cd :{} : no such file or directory",
+                path.display()
+            ))
+        }
     }
 
     pub fn rn_exec(mdata: &exeCmd) -> anyhow::Result<std::process::ExitStatus> {
