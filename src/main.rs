@@ -44,6 +44,7 @@ fn main() {
                     eprintln!("{}", e);
                 }
             }
+            Command::Noop => {}
             Command::CommandNotFound => println!("{} command not found!!", input.trim()),
         }
     }
