@@ -9,34 +9,44 @@ use cmd::{BUILT_IN_COMMANDS, Command};
 
 fn main() {
     loop {
-        print!("{} $ ", Command::pwd_direc());
-        io::stdout().flush().unwrap();
-
         //command
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+        let input = Command::read_input_with_completion();
         let command = Command::from_input(&input);
 
         match command {
             Command::ExitCommand => break,
-            Command::PwdCommand => println!("{}", Command::pwd_direc()),
+            Command::PwdCommand { stdout_file } => {
+                let output = Command::pwd_direc();
+                if let Some(ref file) = stdout_file {
+                    let _ = std::fs::write(file, &output);
+                } else {
+                    println!("{}", output);
+                }
+            }
             Command::CdCommand { directory } => {
                 if let Err(e) = Command::change_directory(directory.name) {
                     eprintln!("{}", e)
                 }
             }
-            Command::EchoCommand { display_string } => println!("{}", display_string.name),
-            Command::TypeCommand { command_name } => {
-                let mut flag = false;
-                if BUILT_IN_COMMANDS.contains(&command_name.name.as_str()) {
-                    println!("{} is a shell builtin", command_name.name);
-                    flag = true;
-                } else if let Some(path) = command_name.path {
-                    flag = true;
-                    println!("{} is {}", command_name.name, path);
+            Command::EchoCommand { display_string } => {
+                if let Some(ref file) = display_string.stdout_file {
+                    let _ = std::fs::write(file, display_string.name);
+                } else {
+                    println!("{}", display_string.name);
                 }
-                if !flag {
-                    println!("{} not found", command_name.name);
+            }
+            Command::TypeCommand { command_name } => {
+                let output = if BUILT_IN_COMMANDS.contains(&command_name.name.as_str()) {
+                    format!("{} is a shell builtin", command_name.name)
+                } else if let Some(ref path) = command_name.path {
+                    format!("{} is {}", command_name.name, path)
+                } else {
+                    format!("{} not found", command_name.name)
+                };
+                if let Some(ref file) = command_name.stdout_file {
+                    let _ = std::fs::write(file, &output);
+                } else {
+                    println!("{}", output);
                 }
             }
             Command::ExecCommand { exec_name } => {

@@ -1,16 +1,20 @@
-#![allow(unused_imports, clippy::enum_variant_names, non_camel_case_types)]
+#![allow(clippy::enum_variant_names, non_camel_case_types)]
 use anyhow::{Context, anyhow};
+use std::cell::Ref;
 use std::env::{self, split_paths, var};
-use std::fs::Metadata;
+use std::fs::{Metadata, write};
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{self, Path};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
+use std::str::CharIndices;
 use std::sync::mpsc::Receiver;
+use termion::{event::Key, input::TermRead, raw::IntoRawMode};
 
 pub const BUILT_IN_COMMANDS: [&str; 4] = ["echo", "type", "exit", "pwd"];
 pub enum Command {
     ExitCommand,
-    PwdCommand,
+    PwdCommand { stdout_file: Option<String> },
     CdCommand { directory: exeCmd },
     EchoCommand { display_string: exeCmd },
     TypeCommand { command_name: exeCmd },
@@ -18,6 +22,12 @@ pub enum Command {
     Noop,
     CommandNotFound,
 }
+enum TabCompletion {
+    Single(String),
+    Multiple(Vec<String>),
+    None,
+}
+
 impl Command {
     //return command type from input
     pub fn from_input(input: &str) -> Self {
@@ -25,51 +35,84 @@ impl Command {
         if input.is_empty() {
             return Command::Noop;
         }
-        let parts: Vec<&str> = input.splitn(2, ' ').collect();
-        let cmd = parts[0];
-        let args = parts.get(1).copied().unwrap_or("");
+        let tokens = Self::tokenize(input);
+        let (cmd_tokens, stdop_file, stdout_append, stderr_file, stderr_append) = {
+            let mut std_op = None;
+            let mut std_append = false;
+            let mut stderr = None;
+            let mut err_append = false;
+            let mut cmd_only = Vec::new();
+            let mut i = 0;
+            while i < tokens.len() {
+                if tokens[i] == ">>" && i + 1 < tokens.len() {
+                    std_op = Some(tokens[i + 1].clone());
+                    std_append = true;
+                    i += 2;
+                    continue;
+                }
+                if tokens[i] == "2>>" && i + 1 < tokens.len() {
+                    stderr = Some(tokens[i + 1].clone());
+                    err_append = true;
+                    i += 2;
+                    continue;
+                }
+                if (tokens[i] == ">" || tokens[i] == "1>") && i + 1 < tokens.len() {
+                    std_op = Some(tokens[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+                if tokens[i] == "2>" && i + 1 < tokens.len() {
+                    stderr = Some(tokens[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+                cmd_only.push(tokens[i].clone());
+                i += 1;
+            }
+            (cmd_only, std_op, std_append, stderr, err_append)
+        };
+        if cmd_tokens.is_empty() {
+            return Command::Noop;
+        }
+
+        let cmd = cmd_tokens[0].as_str();
+        let args = cmd_tokens[1..].join(" ");
 
         match cmd {
             "exit" => Command::ExitCommand,
-            "echo" => {
-                let args = Self::tokenize(input)[1..].join(" ");
-                Command::EchoCommand {
-                    display_string: exeCmd {
-                        name: args,
-                        path: None,
-                        args: vec![],
-                    },
-                }
-            }
+            "echo" => Command::EchoCommand {
+                display_string: exeCmd {
+                    name: args,
+                    path: None,
+                    args: vec![],
+                    stdout_file: stdop_file,
+                    stdout_append: stdout_append,
+                    stderr_file: None,
+                    stderr_append: false,
+                },
+            },
             "type" => {
-                let parse = if let Ok(p) = Command::parse_input(args) {
-                    p
-                } else {
-                    exeCmd {
-                        name: args.to_string(),
-                        path: None,
-                        args: vec![],
-                    }
-                };
+                let parse = Command::parse_input(&args)
+                    .unwrap_or_else(|_| exeCmd::new(&args, None, vec![]));
                 Command::TypeCommand {
                     command_name: parse,
                 }
             }
-            "pwd" => Command::PwdCommand,
+            "pwd" => Command::PwdCommand {
+                stdout_file: stdop_file,
+            },
             "cd" => {
-                let parse = if let Ok(p) = Command::parse_input(args) {
-                    p
-                } else {
-                    exeCmd {
-                        name: args.to_string(),
-                        path: None,
-                        args: vec![],
-                    }
-                };
+                let parse = Command::parse_input(&args)
+                    .unwrap_or_else(|_| exeCmd::new(&args, None, vec![]));
                 Command::CdCommand { directory: parse }
             }
             _ => {
-                if let Ok(data) = Command::parse_input(input) {
+                let clean = cmd_tokens.join(" ");
+                if let Ok(mut data) = Command::parse_input(&clean) {
+                    data.stdout_file = stdop_file;
+                    data.stdout_append = stdout_append;
+                    data.stderr_file = stderr_file;
+                    data.stderr_append = stderr_append;
                     Command::ExecCommand { exec_name: data }
                 } else {
                     Command::CommandNotFound
@@ -96,6 +139,10 @@ impl Command {
             name: cmd_name.to_string(),
             args: arggs,
             path: Some(pta),
+            stdout_file: None,
+            stdout_append: false,
+            stderr_file: None,
+            stderr_append: false,
         })
     }
 
@@ -198,13 +245,172 @@ impl Command {
             .path
             .as_deref()
             .ok_or_else(|| anyhow!("No executable found for path '{}'", mdata.name))?;
-        let mut child = std::process::Command::new(path)
-            .args(&mdata.args)
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .spawn()
-            .context("Failed to spawn a process")?;
+        let mut cmd = std::process::Command::new(path);
+        cmd.args(&mdata.args);
+        cmd.stdin(std::process::Stdio::inherit());
+        if let Some(ref file) = mdata.stdout_file {
+            let f = if mdata.stdout_append {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(file)
+                    .context("Failed to open file for append")?
+            } else {
+                std::fs::File::create(file).context("Failed to Create redirect file")?
+            };
+            cmd.stdout(f);
+        } else {
+            cmd.stdout(std::process::Stdio::inherit());
+        }
+        if let Some(ref file) = mdata.stderr_file {
+            let f = if mdata.stderr_append {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(file)
+                    .context("Failed to open stderr file for append")?
+            } else {
+                std::fs::File::create(file).context("Failed to Create stderr redirect file")?
+            };
+            cmd.stderr(f);
+        } else {
+            cmd.stderr(std::process::Stdio::inherit());
+        }
+        let mut child = cmd.spawn().context("Failed to spawn a process")?;
         child.wait().context("failed to wait on child")
+    }
+
+    //tab_completion
+
+    //LCP
+    fn longest_common_prefix(names: &[String]) -> String {
+        if names.is_empty() {
+            return String::new();
+        }
+        if names.len() == 1 {
+            return names[0].clone();
+        }
+
+        let first = &names[0];
+        let mut prefix_len = first.len();
+        for name in &names[1..] {
+            let common = first
+                .chars()
+                .zip(name.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            prefix_len = prefix_len.min(common);
+        }
+        first[..prefix_len].to_string()
+    }
+    fn tab_completion(buffer: &str) -> TabCompletion {
+        let last_space = buffer.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let prefix = &buffer[last_space..];
+
+        if prefix.is_empty() {
+            return TabCompletion::Multiple(Vec::new());
+        }
+        let mut candidates = Vec::new();
+
+        //builtin prefercne
+        for name in &["echo", "exit"] {
+            if name.starts_with(prefix) {
+                candidates.push(name.to_string());
+            }
+        }
+
+        //exter path execs
+        for exe in Self::get_exec_by_prefix(prefix) {
+            if !candidates.contains(&exe) {
+                candidates.push(exe);
+            }
+        }
+
+        match candidates.len() {
+            0 => TabCompletion::None,
+            1 => TabCompletion::Single(format!("{} ", candidates[0])),
+            _ => {
+                let lcp = Self::longest_common_prefix(&candidates);
+                if lcp.len() > prefix.len() {
+                    TabCompletion::Single(lcp)
+                } else {
+                    TabCompletion::Multiple(candidates)
+                }
+            }
+        }
+    }
+
+    fn get_exec_by_prefix(prefix: &str) -> Vec<String> {
+        let mut mathces = Vec::new();
+        if let Ok(path_env) = var("PATH") {
+            for path in split_paths(&path_env) {
+                if let Ok(entries) = std::fs::read_dir(&path) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with(prefix) && !name.starts_with('.') {
+                            if let Ok(meta) = entry.metadata() {
+                                if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                                    mathces.push(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        mathces.sort();
+        mathces.dedup();
+        mathces
+    }
+
+    pub fn read_input_with_completion() -> String {
+        let mut stdout = io::stdout().into_raw_mode().unwrap();
+        let mut buffer = String::new();
+
+        write!(stdout, "{} $ ", Self::pwd_direc()).unwrap();
+        stdout.flush().unwrap();
+
+        for key in io::stdin().keys() {
+            match key.unwrap() {
+                Key::Char('\n') | Key::Char('\r') => {
+                    write!(stdout, "\r\n");
+                    break;
+                }
+                Key::Char('\t') => match Self::tab_completion(&buffer) {
+                    TabCompletion::Single(s) => {
+                        let last_space = buffer.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                        let completed = buffer[..last_space].to_string() + &s;
+                        write!(stdout, "\r\x1b[K{} $ {}", Command::pwd_direc(), completed).unwrap();
+                        buffer = completed;
+                    }
+                    TabCompletion::Multiple(list) if list.is_empty() => {
+                        write!(stdout, "\x07").unwrap();
+                    }
+                    TabCompletion::Multiple(list) => {
+                        write!(stdout, "\r\n{}\r\n", list.join("        ")).unwrap();
+                        write!(stdout, "{} $ {}", Command::pwd_direc(), buffer).unwrap();
+                    }
+                    TabCompletion::None => {
+                        write!(stdout, "\x07").unwrap();
+                    }
+                },
+                Key::Backspace => {
+                    if !buffer.is_empty() {
+                        buffer.pop();
+                        write!(stdout, "\r\x1b[K{} $ {}", Self::pwd_direc(), buffer).unwrap();
+                    }
+                }
+                Key::Char(c) => {
+                    buffer.push(c);
+                    write!(stdout, "{}", c).unwrap();
+                }
+                _ => {}
+            }
+            stdout.flush().unwrap();
+        }
+        // Raw mode drops when stdout goes out of scope; terminal restores automatically
+        buffer
     }
 }
 
@@ -212,6 +418,10 @@ pub struct exeCmd {
     pub name: String,
     pub path: Option<String>,
     pub args: Vec<String>,
+    pub stdout_file: Option<String>,
+    pub stdout_append: bool,
+    pub stderr_file: Option<String>,
+    pub stderr_append: bool,
 }
 
 impl exeCmd {
@@ -220,6 +430,10 @@ impl exeCmd {
             name: name.to_owned(),
             path: path,
             args,
+            stdout_file: None,
+            stdout_append: false,
+            stderr_file: None,
+            stderr_append: false,
         }
     }
 }
