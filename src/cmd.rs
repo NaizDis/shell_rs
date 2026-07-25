@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{self, Path};
 use std::process::{Output, Stdio};
+use std::slice::SliceIndex;
 use std::str::CharIndices;
 use std::sync::mpsc::Receiver;
 use termion::{event::Key, input::TermRead, raw::IntoRawMode};
@@ -303,6 +304,8 @@ impl Command {
         }
         first[..prefix_len].to_string()
     }
+
+    // Actual Tab completion call
     fn tab_completion(buffer: &str) -> TabCompletion {
         let last_space = buffer.rfind(' ').map(|i| i + 1).unwrap_or(0);
         let prefix = &buffer[last_space..];
@@ -310,8 +313,14 @@ impl Command {
         if prefix.is_empty() {
             return TabCompletion::Multiple(Vec::new());
         }
-        let mut candidates = Vec::new();
 
+        // tab after command/first word
+        if last_space > 0 || prefix.contains('/') || prefix.starts_with('.') {
+            return Self::complete_path(prefix);
+        }
+
+        // tab at first word
+        let mut candidates = Vec::new();
         //builtin prefercne
         for name in &["echo", "exit"] {
             if name.starts_with(prefix) {
@@ -340,6 +349,7 @@ impl Command {
         }
     }
 
+    // Get executable from path varaible by autocomplete
     fn get_exec_by_prefix(prefix: &str) -> Vec<String> {
         let mut mathces = Vec::new();
         if let Ok(path_env) = var("PATH") {
@@ -362,6 +372,59 @@ impl Command {
         mathces.sort();
         mathces.dedup();
         mathces
+    }
+
+    //Completed Path
+    fn complete_path(prefix: &str) -> TabCompletion {
+        let (dir, file_prefix) = match prefix.rfind('/') {
+            Some(i) => ((prefix[..=i]).to_string(), &prefix[i + 1..]),
+            None => (String::new(), prefix),
+        };
+        let search_dir = if dir.is_empty() { "." } else { &dir };
+
+        let mut matches = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(search_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(file_prefix) && !name.starts_with('.') {
+                    let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
+                    let suffix = if is_dir { "/" } else { " " };
+                    matches.push(name + suffix);
+                }
+            }
+        }
+        matches.sort();
+
+        match matches.len() {
+            0 => TabCompletion::None,
+            1 => {
+                let is_dir = std::fs::metadata(search_dir.to_string() + &matches[0])
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                let suffix = if is_dir { "/" } else { " " };
+                TabCompletion::Single(dir.clone() + &matches[0] + suffix)
+            }
+            _ => {
+                let lcp = Self::longest_common_prefix(&matches);
+                if lcp.len() > file_prefix.len() {
+                    TabCompletion::Single(dir + &lcp)
+                } else {
+                    //Build Dispaly with suffix
+                    let display = matches
+                        .iter()
+                        .map(|n| {
+                            let full = dir.clone() + n;
+                            let is_dir = std::fs::metadata(search_dir.to_string() + &matches[0])
+                                .map(|m| m.is_dir())
+                                .unwrap_or(false);
+                            let suffix = if is_dir { "/" } else { " " };
+                            full + suffix
+                        })
+                        .collect();
+                    TabCompletion::Multiple(display)
+                }
+            }
+        }
     }
 
     pub fn read_input_with_completion() -> String {
