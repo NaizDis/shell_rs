@@ -1,11 +1,10 @@
 #![allow(clippy::enum_variant_names, non_camel_case_types)]
-use anyhow::{Context, anyhow};
+use anyhow::{Chain, Context, anyhow};
 use std::cell::Ref;
 use std::collections::HashMap;
 use std::env::{self, split_paths, var};
 use std::fs::{Metadata, write};
 use std::io::{self, Write};
-use std::os::linux::raw::stat;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{self, Path};
 use std::process::{Output, Stdio};
@@ -15,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::mpsc::Receiver;
 use termion::{event::Key, input::TermRead, raw::IntoRawMode};
 
-pub const BUILT_IN_COMMANDS: [&str; 5] = ["echo", "type", "exit", "pwd", "complete"];
+pub const BUILT_IN_COMMANDS: [&str; 6] = ["echo", "type", "exit", "pwd", "complete", "jobs"];
 pub enum Command {
     ExitCommand,
     PwdCommand {
@@ -38,13 +37,46 @@ pub enum Command {
         stdout_file: Option<String>,
         stderr_file: Option<String>,
     },
+    JobsCommand {
+        stdout_file: Option<String>,
+    },
+    CommandChain {
+        segments: Vec<ChainSegment>,
+        background: bool,
+    },
     Noop,
     CommandNotFound,
 }
+
+pub enum ChainOp {
+    And,
+    Or,
+    End,
+}
+pub struct ChainSegment {
+    pub tokens: Vec<String>,
+    pub operator: ChainOp,
+}
+
 enum TabCompletion {
     Single(String),
     Multiple(Vec<String>),
     None,
+}
+
+#[derive(Clone)]
+pub enum JobStatus {
+    Running,
+    Done,
+}
+
+#[derive(Clone)]
+pub struct Job {
+    pub job_number: usize,
+    pub pid: u32,
+    pub command: String,
+    pub status: JobStatus,
+    pub notified: bool,
 }
 
 pub enum CompleteAction {
@@ -63,7 +95,7 @@ impl Command {
             return Command::Noop;
         }
         let tokens = Self::tokenize(input);
-        let (cmd_tokens, stdop_file, stdout_append, stderr_file, stderr_append) = {
+        let (mut cmd_tokens, stdop_file, stdout_append, stderr_file, stderr_append) = {
             let mut std_op = None;
             let mut std_append = false;
             let mut stderr = None;
@@ -98,6 +130,47 @@ impl Command {
             }
             (cmd_only, std_op, std_append, stderr, err_append)
         };
+
+        //check for background opeartr
+        let background = cmd_tokens.last().map(|s| s == "&").unwrap_or(false);
+        if background {
+            cmd_tokens.pop();
+        }
+
+        //check for && and || in cmd
+        let has_chain = cmd_tokens.iter().any(|t| t == "&&" || t == "||");
+        if has_chain {
+            let mut segments = Vec::new();
+            let mut current = Vec::new();
+            for token in &cmd_tokens {
+                if token == "&&" {
+                    segments.push(ChainSegment {
+                        tokens: current,
+                        operator: ChainOp::And,
+                    });
+                    current = Vec::new();
+                } else if token == "||" {
+                    segments.push(ChainSegment {
+                        tokens: current,
+                        operator: ChainOp::Or,
+                    });
+                    current = Vec::new();
+                } else {
+                    current.push(token.clone());
+                }
+            }
+            if !current.is_empty() {
+                segments.push(ChainSegment {
+                    tokens: current,
+                    operator: ChainOp::End,
+                });
+            }
+            return Command::CommandChain {
+                segments,
+                background,
+            };
+        }
+
         if cmd_tokens.is_empty() {
             return Command::Noop;
         }
@@ -116,6 +189,7 @@ impl Command {
                     stdout_append,
                     stderr_file: None,
                     stderr_append: false,
+                    background,
                 },
             },
             "type" => {
@@ -155,6 +229,9 @@ impl Command {
                     stderr_file,
                 }
             }
+            "jobs" => Command::JobsCommand {
+                stdout_file: stdop_file,
+            },
             _ => {
                 let clean = cmd_tokens.join(" ");
                 if let Ok(mut data) = Command::parse_input(&clean) {
@@ -162,6 +239,7 @@ impl Command {
                     data.stdout_append = stdout_append;
                     data.stderr_file = stderr_file;
                     data.stderr_append = stderr_append;
+                    data.background = background;
                     Command::ExecCommand { exec_name: data }
                 } else {
                     Command::CommandNotFound
@@ -192,6 +270,7 @@ impl Command {
             stdout_append: false,
             stderr_file: None,
             stderr_append: false,
+            background: false,
         })
     }
 
@@ -252,6 +331,38 @@ impl Command {
     pub fn completions() -> &'static std::sync::Mutex<HashMap<String, String>> {
         static COMPLETIONS: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
         COMPLETIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    }
+
+    //Jobs list
+    pub fn jobs_list() -> &'static std::sync::Mutex<Vec<Job>> {
+        static JOBS: OnceLock<std::sync::Mutex<Vec<Job>>> = OnceLock::new();
+        JOBS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    //job notifiaction
+    pub fn print_job_noti() {
+        let mut jobs = Self::jobs_list().lock().unwrap();
+        let max_job = jobs.iter().map(|j| j.job_number).max();
+        let second_max = max_job.and_then(|m| {
+            jobs.iter()
+                .filter(|j| j.job_number != m)
+                .map(|j| j.job_number)
+                .max()
+        });
+        for job in jobs.iter_mut() {
+            if matches!(job.status, JobStatus::Done) && !job.notified {
+                let marker = if Some(job.job_number) == max_job {
+                    "+"
+                } else if Some(job.job_number) == second_max {
+                    "-"
+                } else {
+                    " "
+                };
+                println!("[{}]{} Done            {}", job.job_number, marker, job.command);
+                job.notified = true;
+            }
+        }
+        jobs.retain(|j| !matches!(j.status, JobStatus::Done) || !j.notified);
     }
 
     // search enviroment varaible for executable path
@@ -600,6 +711,7 @@ pub struct exeCmd {
     pub stdout_append: bool,
     pub stderr_file: Option<String>,
     pub stderr_append: bool,
+    pub background: bool,
 }
 
 impl exeCmd {
@@ -612,6 +724,7 @@ impl exeCmd {
             stdout_append: false,
             stderr_file: None,
             stderr_append: false,
+            background: false,
         }
     }
 }
