@@ -1,4 +1,5 @@
 #![allow(unused_imports, clippy::enum_variant_names)]
+use std::char::ToUppercase;
 use std::env::{self, split_paths, var};
 use std::fs::Metadata;
 use std::io::{self, Read, Write};
@@ -6,6 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 
 pub mod cmd;
 use cmd::{BUILT_IN_COMMANDS, Command};
+
+use crate::cmd::CompleteAction;
 
 fn main() {
     loop {
@@ -49,6 +52,36 @@ fn main() {
                     println!("{}", output);
                 }
             }
+            Command::CompleteCommand {
+                subcommnad: action,
+                stdout_file,
+                stderr_file,
+            } => match action {
+                CompleteAction::Register { script, command } => {
+                    Command::completions()
+                        .lock()
+                        .unwrap()
+                        .insert(command, script);
+                }
+                CompleteAction::Print { command } => {
+                    let map = Command::completions().lock().unwrap();
+                    let output = if let Some(script) = map.get(&command) {
+                        format!("complete -C '{}' {}", script, command)
+                    } else {
+                        format!("complete : {}: no complete specifications", command)
+                    };
+                    if let Some(ref file) = stdout_file {
+                        let _ = std::fs::write(file, &output);
+                    } else {
+                        println!("{}", output);
+                    }
+                }
+                CompleteAction::Remove { command } => {
+                    Command::completions().lock().unwrap().remove(&command);
+                }
+                CompleteAction::Error(msg) => eprintln!("{}", msg),
+                CompleteAction::Empty => {}
+            },
             Command::ExecCommand { exec_name } => {
                 if let Err(e) = Command::rn_exec(&exec_name) {
                     eprintln!("{}", e);

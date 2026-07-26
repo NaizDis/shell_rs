@@ -1,25 +1,43 @@
 #![allow(clippy::enum_variant_names, non_camel_case_types)]
 use anyhow::{Context, anyhow};
 use std::cell::Ref;
+use std::collections::HashMap;
 use std::env::{self, split_paths, var};
 use std::fs::{Metadata, write};
 use std::io::{self, Write};
+use std::os::linux::raw::stat;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{self, Path};
 use std::process::{Output, Stdio};
 use std::slice::SliceIndex;
 use std::str::CharIndices;
+use std::sync::OnceLock;
 use std::sync::mpsc::Receiver;
 use termion::{event::Key, input::TermRead, raw::IntoRawMode};
 
-pub const BUILT_IN_COMMANDS: [&str; 4] = ["echo", "type", "exit", "pwd"];
+pub const BUILT_IN_COMMANDS: [&str; 5] = ["echo", "type", "exit", "pwd", "complete"];
 pub enum Command {
     ExitCommand,
-    PwdCommand { stdout_file: Option<String> },
-    CdCommand { directory: exeCmd },
-    EchoCommand { display_string: exeCmd },
-    TypeCommand { command_name: exeCmd },
-    ExecCommand { exec_name: exeCmd },
+    PwdCommand {
+        stdout_file: Option<String>,
+    },
+    CdCommand {
+        directory: exeCmd,
+    },
+    EchoCommand {
+        display_string: exeCmd,
+    },
+    TypeCommand {
+        command_name: exeCmd,
+    },
+    ExecCommand {
+        exec_name: exeCmd,
+    },
+    CompleteCommand {
+        subcommnad: CompleteAction,
+        stdout_file: Option<String>,
+        stderr_file: Option<String>,
+    },
     Noop,
     CommandNotFound,
 }
@@ -27,6 +45,14 @@ enum TabCompletion {
     Single(String),
     Multiple(Vec<String>),
     None,
+}
+
+pub enum CompleteAction {
+    Register { script: String, command: String },
+    Print { command: String },
+    Remove { command: String },
+    Error(String),
+    Empty,
 }
 
 impl Command {
@@ -87,7 +113,7 @@ impl Command {
                     path: None,
                     args: vec![],
                     stdout_file: stdop_file,
-                    stdout_append: stdout_append,
+                    stdout_append,
                     stderr_file: None,
                     stderr_append: false,
                 },
@@ -107,6 +133,28 @@ impl Command {
                     .unwrap_or_else(|_| exeCmd::new(&args, None, vec![]));
                 Command::CdCommand { directory: parse }
             }
+            "complete" => {
+                let tokens = Self::tokenize(&args);
+                let action = match tokens.as_slice() {
+                    [flag, script, cmd] if flag == "-C" => CompleteAction::Register {
+                        script: script.clone(),
+                        command: cmd.clone(),
+                    },
+                    [flag, cmd] if flag == "-p" => CompleteAction::Print {
+                        command: cmd.clone(),
+                    },
+                    [flag, cmd] if flag == "-r" => CompleteAction::Remove {
+                        command: cmd.clone(),
+                    },
+                    [] => CompleteAction::Empty,
+                    _ => CompleteAction::Error("complete: unrecognised flag".to_string()),
+                };
+                Command::CompleteCommand {
+                    subcommnad: action,
+                    stdout_file: stdop_file,
+                    stderr_file,
+                }
+            }
             _ => {
                 let clean = cmd_tokens.join(" ");
                 if let Ok(mut data) = Command::parse_input(&clean) {
@@ -125,7 +173,7 @@ impl Command {
     // parse and validate the input to return coomand executable strcuture
     pub fn parse_input(input: &str) -> anyhow::Result<exeCmd> {
         let parts = Self::tokenize(input);
-        if parts.len() < 1 {
+        if parts.is_empty() {
             return Err(anyhow!("Invalid Input !!"));
         }
 
@@ -198,6 +246,12 @@ impl Command {
         env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "?/?".to_string())
+    }
+
+    //completions storeage
+    pub fn completions() -> &'static std::sync::Mutex<HashMap<String, String>> {
+        static COMPLETIONS: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+        COMPLETIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
     }
 
     // search enviroment varaible for executable path
@@ -309,6 +363,54 @@ impl Command {
     fn tab_completion(buffer: &str) -> TabCompletion {
         let last_space = buffer.rfind(' ').map(|i| i + 1).unwrap_or(0);
         let prefix = &buffer[last_space..];
+
+        if last_space > 0 {
+            let first_space = buffer.find(' ').unwrap();
+            let command = &buffer[..first_space];
+            let prefix = &buffer[last_space..];
+
+            let prev_word = {
+                let start = first_space + 1;
+                let end = last_space - 1;
+                if start <= end {
+                    buffer[start..end].trim().to_string()
+                } else {
+                    String::new()
+                }
+            };
+
+            let map = Self::completions().lock().unwrap();
+            if let Some(script) = map.get(command) {
+                if let Ok(output) = std::process::Command::new(script)
+                    .arg(command)
+                    .arg(prefix)
+                    .arg(&prev_word)
+                    .env("COMP_LINE", buffer)
+                    .env("COMP_POINT", buffer.len().to_string())
+                    .stderr(std::process::Stdio::inherit())
+                    .output()
+                {
+                    let output_text = String::from_utf8_lossy(&output.stdout);
+                    let lines: Vec<String> =
+                        output_text.lines().map(|l| l.trim().to_string()).collect();
+
+                    match lines.len() {
+                        0 => {} //normal completion
+                        1 => return TabCompletion::Single(format!("{} ", lines[0])),
+                        _ => {
+                            let mut sortes = lines;
+                            sortes.sort();
+                            let lcp = Self::longest_common_prefix(&sortes);
+                            if lcp.len() > prefix.len() {
+                                return TabCompletion::Single(lcp); //LCP found 
+                            } else {
+                                return TabCompletion::Multiple(sortes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         if prefix.is_empty() {
             return TabCompletion::Multiple(Vec::new());
@@ -434,10 +536,12 @@ impl Command {
         write!(stdout, "{} $ ", Self::pwd_direc()).unwrap();
         stdout.flush().unwrap();
 
+        let mut prev_tab_buffer: Option<String> = None;
+
         for key in io::stdin().keys() {
             match key.unwrap() {
                 Key::Char('\n') | Key::Char('\r') => {
-                    write!(stdout, "\r\n");
+                    write!(stdout, "\r\n").unwrap();
                     break;
                 }
                 Key::Char('\t') => match Self::tab_completion(&buffer) {
@@ -446,16 +550,27 @@ impl Command {
                         let completed = buffer[..last_space].to_string() + &s;
                         write!(stdout, "\r\x1b[K{} $ {}", Command::pwd_direc(), completed).unwrap();
                         buffer = completed;
+                        prev_tab_buffer = None;
                     }
                     TabCompletion::Multiple(list) if list.is_empty() => {
+                        prev_tab_buffer = None;
                         write!(stdout, "\x07").unwrap();
                     }
                     TabCompletion::Multiple(list) => {
-                        write!(stdout, "\r\n{}\r\n", list.join("        ")).unwrap();
-                        write!(stdout, "{} $ {}", Command::pwd_direc(), buffer).unwrap();
+                        // second tab same buffer === dispaly
+                        if prev_tab_buffer.as_deref() == Some(buffer.as_str()) {
+                            write!(stdout, "\r\n{}\r\n", list.join("        ")).unwrap();
+                            write!(stdout, "{} $ {}", Command::pwd_direc(), buffer).unwrap();
+                            prev_tab_buffer = None;
+                        } else {
+                            // First tab === ring bell ,save for later
+                            write!(stdout, "\x07").unwrap();
+                            prev_tab_buffer = Some(buffer.clone())
+                        }
                     }
                     TabCompletion::None => {
                         write!(stdout, "\x07").unwrap();
+                        prev_tab_buffer = None;
                     }
                 },
                 Key::Backspace => {
@@ -491,7 +606,7 @@ impl exeCmd {
     pub fn new(name: &str, path: Option<String>, args: Vec<String>) -> Self {
         Self {
             name: name.to_owned(),
-            path: path,
+            path,
             args,
             stdout_file: None,
             stdout_append: false,
