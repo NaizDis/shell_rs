@@ -1,4 +1,5 @@
 #![allow(unused_imports, clippy::enum_variant_names)]
+use std::array::from_ref;
 use std::char::ToUppercase;
 use std::env::{self, split_paths, var};
 use std::fs::Metadata;
@@ -253,6 +254,202 @@ fn main() {
                     }
                 }
             }
+
+            //piped command (bg = false)
+            Command::PipeCommand {
+                left,
+                right,
+                background: false,
+            } => {
+                let left_bytes = match left.as_ref() {
+                    Command::ExecCommand { exec_name } => {
+                        match std::process::Command::new(
+                            exec_name.path.as_deref().unwrap_or(&exec_name.name),
+                        )
+                        .args(&exec_name.args)
+                        .stderr(std::process::Stdio::inherit())
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
+                        {
+                            Ok(mut child) => {
+                                let mut buf = Vec::new();
+                                use std::io::Read;
+                                if let Some(mut stdout) = child.stdout.take() {
+                                    let _ = stdout.read_to_end(&mut buf);
+                                }
+                                let _ = child.wait();
+                                buf
+                            }
+                            Err(e) => {
+                                eprintln!("{}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    Command::EchoCommand { display_string } => {
+                        format!("{}\n", display_string.name).into_bytes()
+                    }
+                    Command::TypeCommand { command_name } => {
+                        let output = if BUILT_IN_COMMANDS.contains(&command_name.name.as_str()) {
+                            format!("{} is a shell builtin", command_name.name)
+                        } else if let Some(ref path) = command_name.path {
+                            format!("{} is {}", command_name.name, path)
+                        } else {
+                            format!("{} not found", command_name.name)
+                        };
+                        format!("{}\n", output).into_bytes()
+                    }
+                    Command::PwdCommand { .. } => {
+                        format!("{}\n", Command::pwd_direc()).into_bytes()
+                    }
+                    _ => Vec::new(),
+                };
+                match right.as_ref() {
+                    Command::ExecCommand { exec_name } => {
+                        use std::io::Write;
+                        match std::process::Command::new(
+                            exec_name.path.as_deref().unwrap_or(&exec_name.name),
+                        )
+                        .args(&exec_name.args)
+                        .stdin(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::inherit())
+                        .stdout(std::process::Stdio::inherit())
+                        .spawn()
+                        {
+                            Ok(mut child) => {
+                                if let Some(mut stdin) = child.stdin.take() {
+                                    let _ = stdin.write_all(&left_bytes);
+                                }
+                                let _ = child.wait();
+                            }
+                            Err(e) => eprintln!("{}", e),
+                        }
+                    }
+                    _ => {
+                        Command::execute_builtin(right.as_ref());
+                    }
+                }
+            }
+            // piped command -- bg == true
+            Command::PipeCommand {
+                left,
+                right,
+                background: true,
+            } => {
+                let left_bytes = match left.as_ref() {
+                    Command::ExecCommand { exec_name } => {
+                        match std::process::Command::new(
+                            exec_name.path.as_deref().unwrap_or(&exec_name.name),
+                        )
+                        .args(&exec_name.args)
+                        .stderr(std::process::Stdio::inherit())
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
+                        {
+                            Ok(mut child) => {
+                                let mut buf = Vec::new();
+                                use std::io::Read;
+                                if let Some(mut stdout) = child.stdout.take() {
+                                    let _ = stdout.read_to_end(&mut buf);
+                                }
+                                let _ = child.wait();
+                                buf
+                            }
+                            Err(e) => {
+                                eprintln!("{}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    Command::EchoCommand { display_string } => {
+                        format!("{}\n", display_string.name).into_bytes()
+                    }
+                    Command::TypeCommand { command_name } => {
+                        let output = if BUILT_IN_COMMANDS.contains(&command_name.name.as_str()) {
+                            format!("{} is a shell builtin", command_name.name)
+                        } else if let Some(ref path) = command_name.path {
+                            format!("{} is {}", command_name.name, path)
+                        } else {
+                            format!("{} not found", command_name.name)
+                        };
+                        format!("{}\n", output).into_bytes()
+                    }
+                    Command::PwdCommand { .. } => {
+                        format!("{}\n", Command::pwd_direc()).into_bytes()
+                    }
+                    _ => Vec::new(),
+                };
+
+                let mut right_child: Option<std::process::Child> = None;
+                let pid = match right.as_ref() {
+                    Command::ExecCommand { exec_name } => {
+                        use std::io::Write;
+                        match std::process::Command::new(
+                            exec_name.path.as_deref().unwrap_or(&exec_name.name),
+                        )
+                        .args(&exec_name.args)
+                        .stdin(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::inherit())
+                        .stdout(std::process::Stdio::inherit())
+                        .spawn()
+                        {
+                            Ok(mut child) => {
+                                let pid = child.id();
+                                child
+                                    .stdin
+                                    .as_mut()
+                                    .map(|stdin| stdin.write_all(&left_bytes));
+                                right_child = Some(child);
+                                pid
+                            }
+                            Err(e) => {
+                                eprintln!("{}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        Command::execute_builtin(right.as_ref());
+                        0
+                    }
+                };
+
+                let job_number = {
+                    let mut jobs = Command::jobs_list().lock().unwrap();
+                    let n = jobs.iter().map(|j| j.job_number).max().unwrap_or(0) + 1;
+                    let desc_left = if let Command::ExecCommand { exec_name } = left.as_ref() {
+                        &exec_name.name
+                    } else {
+                        "builtin"
+                    };
+                    let desc_right = if let Command::ExecCommand { exec_name } = right.as_ref() {
+                        &exec_name.name
+                    } else {
+                        "builtin"
+                    };
+                    jobs.push(Job {
+                        job_number: n,
+                        pid,
+                        command: format!("{} | {}", desc_left, desc_right),
+                        status: JobStatus::Running,
+                        notified: false,
+                    });
+                    n
+                };
+                println!("[{}] {}", job_number, pid);
+                if let Some(mut child) = right_child {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                        let mut jobs = Command::jobs_list().lock().unwrap();
+                        if let Some(job) = jobs.iter_mut().find(|j| j.job_number == job_number) {
+                            job.status = JobStatus::Done;
+                        }
+                    });
+                }
+            }
+
             Command::JobsCommand { stdout_file } => {
                 let mut jobs = Command::jobs_list().lock().unwrap();
                 let max_job = jobs.iter().map(|j| j.job_number).max();

@@ -12,6 +12,7 @@ use std::slice::SliceIndex;
 use std::str::CharIndices;
 use std::sync::OnceLock;
 use std::sync::mpsc::Receiver;
+use termion::cursor::Right;
 use termion::{event::Key, input::TermRead, raw::IntoRawMode};
 
 pub const BUILT_IN_COMMANDS: [&str; 6] = ["echo", "type", "exit", "pwd", "complete", "jobs"];
@@ -42,6 +43,11 @@ pub enum Command {
     },
     CommandChain {
         segments: Vec<ChainSegment>,
+        background: bool,
+    },
+    PipeCommand {
+        left: Box<Command>,
+        right: Box<Command>,
         background: bool,
     },
     Noop,
@@ -135,6 +141,47 @@ impl Command {
         let background = cmd_tokens.last().map(|s| s == "&").unwrap_or(false);
         if background {
             cmd_tokens.pop();
+        }
+
+        //pipe check
+        let pipe_pos = cmd_tokens.iter().position(|t| t == "|");
+        if let Some(pos) = pipe_pos {
+            if pos == 0 || pos == cmd_tokens.len() - 1 {
+                return Command::CommandNotFound;
+            }
+            let left_tokens: Vec<&str> = cmd_tokens[..pos].iter().map(|s| s.as_str()).collect();
+            let right_tokens: Vec<&str> =
+                cmd_tokens[pos + 1..].iter().map(|s| s.as_str()).collect();
+
+            // single commnad implementation
+            if left_tokens.contains(&"|") || right_tokens.contains(&"|") {
+                return Command::CommandNotFound;
+            }
+            if left_tokens.contains(&"&&")
+                || right_tokens.contains(&"&&")
+                || left_tokens.contains(&"||")
+                || right_tokens.contains(&"||")
+            {
+                return Command::CommandNotFound;
+            }
+            let left_input = left_tokens.join(" ");
+            let right_input = right_tokens.join(" ");
+            let left_cmd = Command::from_input(&left_input);
+            let right_cmd = Command::from_input(&right_input);
+            let ok = |c: &Command| {
+                !matches!(
+                    c,
+                    Command::Noop | Command::CommandNotFound | Command::ExitCommand
+                )
+            };
+            if ok(&left_cmd) && ok(&right_cmd) {
+                return Command::PipeCommand {
+                    left: Box::new(left_cmd),
+                    right: Box::new(right_cmd),
+                    background,
+                };
+            }
+            return Command::CommandNotFound;
         }
 
         //check for && and || in cmd
@@ -358,7 +405,10 @@ impl Command {
                 } else {
                     " "
                 };
-                println!("[{}]{} Done            {}", job.job_number, marker, job.command);
+                println!(
+                    "[{}]{} Done            {}",
+                    job.job_number, marker, job.command
+                );
                 job.notified = true;
             }
         }
@@ -444,6 +494,45 @@ impl Command {
         }
         let mut child = cmd.spawn().context("Failed to spawn a process")?;
         child.wait().context("failed to wait on child")
+    }
+
+    //execute_builtin on right
+    pub fn execute_builtin(cmd: &Command) -> bool {
+        match cmd {
+            Command::EchoCommand { display_string } => {
+                if let Some(file) = &display_string.stdout_file {
+                    let _ = std::fs::write(file, &display_string.name);
+                } else {
+                    println!("{}", display_string.name)
+                }
+                true
+            }
+            Command::TypeCommand { command_name } => {
+                let output = if BUILT_IN_COMMANDS.contains(&command_name.name.as_str()) {
+                    format!("{} is a shell builtin", command_name.name)
+                } else if let Some(ref path) = command_name.path {
+                    format!("{} is {}", command_name.name, path)
+                } else {
+                    format!("{} not found", command_name.name)
+                };
+                if let Some(file) = &command_name.stdout_file {
+                    let _ = std::fs::write(file, &output);
+                } else {
+                    println!("{}", output);
+                }
+                true
+            }
+            Command::PwdCommand { stdout_file } => {
+                let output = Command::pwd_direc();
+                if let Some(file) = stdout_file {
+                    let _ = std::fs::write(file, &output);
+                } else {
+                    println!("{}", output)
+                }
+                true
+            }
+            _ => true,
+        }
     }
 
     //tab_completion
