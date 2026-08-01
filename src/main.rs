@@ -1,4 +1,5 @@
 #![allow(unused_imports, clippy::enum_variant_names)]
+use std::arch::x86_64::CpuidResult;
 use std::array::from_ref;
 use std::char::ToUppercase;
 use std::env::{self, split_paths, var};
@@ -20,6 +21,7 @@ fn main() {
 
         //command
         let input = Command::read_input_with_completion();
+        Command::add_history(&input);
         let command = Command::from_input(&input);
 
         match command {
@@ -88,6 +90,25 @@ fn main() {
                 CompleteAction::Error(msg) => eprintln!("{}", msg),
                 CompleteAction::Empty => {}
             },
+            //history command
+            Command::HistoryCommand { stdout_file, count } => {
+                let history = Command::history_list().lock().unwrap();
+                let len = history.len();
+                let start = count.map(|n| len.saturating_sub(n)).unwrap_or(0);
+                let text = history
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .map(|(i, cmd)| format!("{:>5}    {}", i + 1, cmd))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if let Some(ref file) = stdout_file {
+                    let _ = std::fs::write(file, &text);
+                } else if !text.is_empty() {
+                    println!("{}", text);
+                }
+            }
+
             //background == true
             Command::CommandChain {
                 segments,

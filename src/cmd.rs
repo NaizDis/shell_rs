@@ -15,7 +15,9 @@ use std::sync::mpsc::Receiver;
 use termion::cursor::Right;
 use termion::{event::Key, input::TermRead, raw::IntoRawMode};
 
-pub const BUILT_IN_COMMANDS: [&str; 6] = ["echo", "type", "exit", "pwd", "complete", "jobs"];
+pub const BUILT_IN_COMMANDS: [&str; 7] =
+    ["echo", "type", "exit", "pwd", "complete", "jobs", "history"];
+
 pub enum Command {
     ExitCommand,
     PwdCommand {
@@ -40,6 +42,10 @@ pub enum Command {
     },
     JobsCommand {
         stdout_file: Option<String>,
+    },
+    HistoryCommand {
+        stdout_file: Option<String>,
+        count: Option<usize>,
     },
     CommandChain {
         segments: Vec<ChainSegment>,
@@ -278,6 +284,17 @@ impl Command {
             "jobs" => Command::JobsCommand {
                 stdout_file: stdop_file,
             },
+            "history" => {
+                let count = if args.trim().is_empty() {
+                    None
+                } else {
+                    args.trim().parse::<usize>().ok()
+                };
+                Command::HistoryCommand {
+                    stdout_file: stdop_file,
+                    count,
+                }
+            }
             _ => {
                 let clean = cmd_tokens.join(" ");
                 if let Ok(mut data) = Command::parse_input(&clean) {
@@ -377,6 +394,19 @@ impl Command {
     pub fn completions() -> &'static std::sync::Mutex<HashMap<String, String>> {
         static COMPLETIONS: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
         COMPLETIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    }
+
+    //history list
+    pub fn history_list() -> &'static std::sync::Mutex<Vec<String>> {
+        static HISTORY: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+        HISTORY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    //add to history
+    pub fn add_history(cmd: &str) {
+        if !cmd.trim().is_empty() {
+            Self::history_list().lock().unwrap().push(cmd.to_string());
+        }
     }
 
     //Jobs list
@@ -697,6 +727,8 @@ impl Command {
         stdout.flush().unwrap();
 
         let mut prev_tab_buffer: Option<String> = None;
+        let mut saved_buffer: Option<String> = None;
+        let mut hist_pos: Option<usize> = None;
 
         for key in io::stdin().keys() {
             match key.unwrap() {
@@ -742,6 +774,37 @@ impl Command {
                 Key::Char(c) => {
                     buffer.push(c);
                     write!(stdout, "{}", c).unwrap();
+                }
+                Key::Up => {
+                    let history = Self::history_list().lock().unwrap();
+                    if history.is_empty() {
+                        continue;
+                    }
+                    if hist_pos.is_none() {
+                        saved_buffer = Some(buffer.clone());
+                    }
+                    let pos = match hist_pos {
+                        Some(i) => i.saturating_sub(1),
+                        None => history.len() - 1,
+                    };
+                    hist_pos = Some(pos);
+                    buffer = history[pos].clone();
+                    prev_tab_buffer = None;
+                    write!(stdout, "\r\x1b[K{} $ {}", Self::pwd_direc(), buffer).unwrap();
+                }
+                Key::Down => {
+                    if let Some(i) = hist_pos {
+                        let history = Self::history_list().lock().unwrap();
+                        if i + 1 < history.len() {
+                            hist_pos = Some(i + 1);
+                            buffer = history[i + 1].clone();
+                        } else {
+                            hist_pos = None;
+                            buffer = saved_buffer.take().unwrap_or_default();
+                        }
+                        prev_tab_buffer = None;
+                        write!(stdout, "\r\x1b[K{} $ {}", Self::pwd_direc(), buffer).unwrap();
+                    }
                 }
                 _ => {}
             }
