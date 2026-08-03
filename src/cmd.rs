@@ -4,6 +4,7 @@ use std::cell::Ref;
 use std::collections::HashMap;
 use std::env::{self, split_paths, var};
 use std::fs::{Metadata, write};
+use std::hash::Hash;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{self, Path};
@@ -15,8 +16,9 @@ use std::sync::mpsc::Receiver;
 use termion::cursor::Right;
 use termion::{event::Key, input::TermRead, raw::IntoRawMode};
 
-pub const BUILT_IN_COMMANDS: [&str; 7] =
-    ["echo", "type", "exit", "pwd", "complete", "jobs", "history"];
+pub const BUILT_IN_COMMANDS: [&str; 8] = [
+    "echo", "type", "exit", "pwd", "complete", "jobs", "history", "declare",
+];
 
 pub enum Command {
     ExitCommand,
@@ -49,6 +51,10 @@ pub enum Command {
         read_file: Option<String>,
         write_file: Option<String>,
         append_file: Option<String>,
+    },
+    DeclareCommand {
+        subcommand: DeclareAction,
+        stdout_file: Option<String>,
     },
     CommandChain {
         segments: Vec<ChainSegment>,
@@ -101,6 +107,13 @@ pub enum CompleteAction {
     Empty,
 }
 
+pub enum DeclareAction {
+    Print { name: String },
+    Set { name: String, value: String },
+    Error(String),
+    Empty,
+}
+
 impl Command {
     //return command type from input
     pub fn from_input(input: &str) -> Self {
@@ -144,6 +157,12 @@ impl Command {
             }
             (cmd_only, std_op, std_append, stderr, err_append)
         };
+
+        //expand $VAR tokens before parsing
+        cmd_tokens = cmd_tokens
+            .into_iter()
+            .map(|t| Self::expand_param(&t))
+            .collect();
 
         //check for background opeartr
         let background = cmd_tokens.last().map(|s| s == "&").unwrap_or(false);
@@ -317,6 +336,37 @@ impl Command {
                     append_file,
                 }
             }
+            "declare" => {
+                let toks = Self::tokenize(&args);
+                let subcommand = match toks.as_slice() {
+                    [flag, name] if flag == "-p" => DeclareAction::Print { name: name.clone() },
+                    [assignment] => {
+                        if assignment.starts_with('-') {
+                            DeclareAction::Error("declare: unrecognised flag".to_string())
+                        } else {
+                            let (name, value) = assignment
+                                .split_once('=')
+                                .map_or((assignment.clone(), String::new()), |(n, v)| {
+                                    (n.to_string(), v.to_string())
+                                });
+                            if Self::valid_identifier(&name) {
+                                DeclareAction::Set { name, value }
+                            } else {
+                                DeclareAction::Error(format!(
+                                    "declare : `{}': not valid indentifier",
+                                    assignment
+                                ))
+                            }
+                        }
+                    }
+                    [] => DeclareAction::Empty,
+                    _ => DeclareAction::Error("declare: unrecognised flag".to_string()),
+                };
+                Command::DeclareCommand {
+                    subcommand,
+                    stdout_file: stdop_file,
+                }
+            }
             _ => {
                 let clean = cmd_tokens.join(" ");
                 if let Ok(mut data) = Command::parse_input(&clean) {
@@ -357,6 +407,49 @@ impl Command {
             stderr_append: false,
             background: false,
         })
+    }
+
+    //expand sime $NAME / ${NAME} referece with shell variables value
+    fn expand_param(tok: &str) -> String {
+        let vars = Self::shell_vars().lock().unwrap();
+        let mut out = String::new();
+        let mut rest = tok;
+        while let Some(idx) = rest.find('$') {
+            out.push_str(&rest[..idx]);
+            let after = &rest[idx + 1..];
+            if let Some(inner) = after.strip_prefix('{') {
+                match inner.find('}') {
+                    Some(close) => {
+                        let name = &inner[..close];
+                        if let Some(v) = vars.get(name) {
+                            out.push_str(v);
+                        }
+                        rest = &inner[close + 1..];
+                    }
+                    None => {
+                        out.push('$');
+                        rest = after
+                    }
+                }
+            } else {
+                let end = after
+                    .char_indices()
+                    .find_map(|(i, c)| (!(c.is_ascii_alphanumeric() || c == '_')).then_some(i))
+                    .unwrap_or(after.len());
+                let name = &after[..end];
+                if name.is_empty() {
+                    out.push('$');
+                    rest = after;
+                } else {
+                    if let Some(v) = vars.get(name) {
+                        out.push_str(v);
+                    }
+                    rest = &after[end..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
     }
 
     // Create Tokens/Args/Parse out of given input
@@ -403,6 +496,16 @@ impl Command {
             tokens.push(current);
         }
         tokens
+    }
+
+    //shell vraible indentifier valid - start with letter or _ ,rest anything
+    fn valid_identifier(name: &str) -> bool {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
 
     //current working directory
@@ -505,6 +608,12 @@ impl Command {
             }
         }
         jobs.retain(|j| !matches!(j.status, JobStatus::Done) || !j.notified);
+    }
+
+    //shell varaible storeage
+    pub fn shell_vars() -> &'static std::sync::Mutex<HashMap<String, String>> {
+        static VARS: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+        VARS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
     }
 
     // search enviroment varaible for executable path

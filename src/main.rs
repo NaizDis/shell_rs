@@ -13,7 +13,7 @@ pub mod cmd;
 use anyhow::Chain;
 use cmd::BUILT_IN_COMMANDS;
 
-use crate::cmd::{ChainOp, Command, CompleteAction, Job, JobStatus};
+use crate::cmd::{ChainOp, Command, CompleteAction, DeclareAction, Job, JobStatus};
 
 fn main() {
     Command::load_hist_from_env();
@@ -156,6 +156,28 @@ fn main() {
                     }
                 }
             }
+
+            Command::DeclareCommand {
+                subcommand,
+                stdout_file,
+            } => match subcommand {
+                DeclareAction::Print { name } => {
+                    let output = match Command::shell_vars().lock().unwrap().get(&name) {
+                        Some(value) => format!("declare -- {}=\"{}\"", name, value),
+                        None => format!("declare: {}: not found", name),
+                    };
+                    if let Some(ref file) = stdout_file {
+                        let _ = std::fs::write(file, &output);
+                    } else {
+                        println!("{}", output);
+                    }
+                }
+                DeclareAction::Set { name, value } => {
+                    Command::shell_vars().lock().unwrap().insert(name, value);
+                }
+                DeclareAction::Error(msg) => eprintln!("{}", msg),
+                DeclareAction::Empty => {}
+            },
 
             //background == true
             Command::CommandChain {
