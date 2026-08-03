@@ -978,6 +978,11 @@ impl Command {
                         write!(stdout, "\r\x1b[K{} $ {}", Self::pwd_direc(), buffer).unwrap();
                     }
                 }
+                Key::Ctrl('c') => {
+                    write!(stdout, "^C\r\n").unwrap();
+                    buffer = "exit".to_string();
+                    break;
+                }
                 _ => {}
             }
             stdout.flush().unwrap();
