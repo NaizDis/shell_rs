@@ -6,6 +6,7 @@ use std::env::{self, split_paths, var};
 use std::fs::Metadata;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::path;
 use std::process::Output;
 
 pub mod cmd;
@@ -15,6 +16,7 @@ use cmd::BUILT_IN_COMMANDS;
 use crate::cmd::{ChainOp, Command, CompleteAction, Job, JobStatus};
 
 fn main() {
+    Command::load_hist_from_env();
     loop {
         //update process table and push notifaction
         Command::print_job_noti();
@@ -25,7 +27,10 @@ fn main() {
         let command = Command::from_input(&input);
 
         match command {
-            Command::ExitCommand => break,
+            Command::ExitCommand => {
+                Command::save_to_histfile();
+                break;
+            }
             Command::PwdCommand { stdout_file } => {
                 let output = Command::pwd_direc();
                 if let Some(ref file) = stdout_file {
@@ -91,21 +96,64 @@ fn main() {
                 CompleteAction::Empty => {}
             },
             //history command
-            Command::HistoryCommand { stdout_file, count } => {
-                let history = Command::history_list().lock().unwrap();
-                let len = history.len();
-                let start = count.map(|n| len.saturating_sub(n)).unwrap_or(0);
-                let text = history
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .map(|(i, cmd)| format!("{:>5}    {}", i + 1, cmd))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if let Some(ref file) = stdout_file {
-                    let _ = std::fs::write(file, &text);
-                } else if !text.is_empty() {
-                    println!("{}", text);
+            Command::HistoryCommand {
+                stdout_file,
+                count,
+                read_file,
+                write_file,
+                append_file,
+            } => {
+                if let Some(path) = read_file {
+                    if let Ok(contents) = std::fs::read_to_string(&path) {
+                        for line in contents.lines() {
+                            Command::add_history(line);
+                        }
+                    }
+                    {
+                        let history = Command::history_list().lock().unwrap();
+                        *Command::history_written().lock().unwrap() = history.len();
+                    }
+                } else if let Some(path) = write_file {
+                    let content = {
+                        let history = Command::history_list().lock().unwrap();
+                        let text = history.join("\n") + "\n";
+                        *Command::history_written().lock().unwrap() = history.len();
+                        text
+                    };
+                    let _ = std::fs::write(&path, content);
+                } else if let Some(path) = append_file {
+                    let to_append = {
+                        let history = Command::history_list().lock().unwrap();
+                        let mut cursor = Command::history_written().lock().unwrap();
+                        let start = (*cursor).min(history.len());
+                        let text = history[start..].join("\n");
+                        *cursor = history.len();
+                        text
+                    };
+                    if !to_append.is_empty() {
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .unwrap();
+                        writeln!(file, "{}", to_append).unwrap();
+                    }
+                } else {
+                    let history = Command::history_list().lock().unwrap();
+                    let len = history.len();
+                    let start = count.map(|n| len.saturating_sub(n)).unwrap_or(0);
+                    let text = history
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .map(|(i, cmd)| format!("{:>5}    {}", i + 1, cmd))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if let Some(ref file) = stdout_file {
+                        let _ = std::fs::write(file, &text);
+                    } else if !text.is_empty() {
+                        println!("{}", text);
+                    }
                 }
             }
 

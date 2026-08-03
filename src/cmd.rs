@@ -46,6 +46,9 @@ pub enum Command {
     HistoryCommand {
         stdout_file: Option<String>,
         count: Option<usize>,
+        read_file: Option<String>,
+        write_file: Option<String>,
+        append_file: Option<String>,
     },
     CommandChain {
         segments: Vec<ChainSegment>,
@@ -285,14 +288,33 @@ impl Command {
                 stdout_file: stdop_file,
             },
             "history" => {
-                let count = if args.trim().is_empty() {
-                    None
-                } else {
+                let mut read_file = None;
+                let mut write_file = None;
+                let mut append_file = None;
+                let toks = Self::tokenize(&args);
+                if let [flag, path] = toks.as_slice() {
+                    match flag.as_str() {
+                        "-r" => read_file = Some(path.clone()),
+                        "-w" => write_file = Some(path.clone()),
+                        "-a" => append_file = Some(path.clone()),
+                        _ => {}
+                    }
+                }
+                let count = if read_file.is_none()
+                    && write_file.is_none()
+                    && append_file.is_none()
+                    && !args.trim().is_empty()
+                {
                     args.trim().parse::<usize>().ok()
+                } else {
+                    None
                 };
                 Command::HistoryCommand {
                     stdout_file: stdop_file,
                     count,
+                    read_file,
+                    write_file,
+                    append_file,
                 }
             }
             _ => {
@@ -407,6 +429,47 @@ impl Command {
         if !cmd.trim().is_empty() {
             Self::history_list().lock().unwrap().push(cmd.to_string());
         }
+    }
+
+    //load history from file on startup
+    pub fn load_hist_from_env() {
+        if let Ok(path) = env::var("HISTFILE") {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                for line in contents.lines() {
+                    Self::add_history(line);
+                }
+            }
+            let history = Self::history_list().lock().unwrap();
+            *Self::history_written().lock().unwrap() = history.len();
+        }
+    }
+
+    //save to history file on exit
+    pub fn save_to_histfile() {
+        if let Ok(path) = env::var("HISTFILE") {
+            let to_append = {
+                let history = Command::history_list().lock().unwrap();
+                let mut cursor = Command::history_written().lock().unwrap();
+                let start = (*cursor).min(history.len());
+                let text = history[start..].join("\n");
+                *cursor = history.len();
+                text
+            };
+            if !to_append.is_empty() {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                writeln!(file, "{}", to_append).unwrap();
+            }
+        }
+    }
+
+    //number of history entries already persisted to a file
+    pub fn history_written() -> &'static std::sync::Mutex<usize> {
+        static WRITTEN: OnceLock<std::sync::Mutex<usize>> = OnceLock::new();
+        WRITTEN.get_or_init(|| std::sync::Mutex::new(0))
     }
 
     //Jobs list

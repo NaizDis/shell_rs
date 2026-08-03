@@ -1,0 +1,40 @@
+ls
+clear
+ls
+history
+ls
+history -r test_history.txt  
+echo hello
+echo world
+clear
+ls
+history
+echo hello
+clear
+ls
+history -w test_history.txt  
+echo new command
+history -a test_history.txt  
+ls
+clear
+l
+sl
+clear
+history -a test_history.txt  
+ls
+clear
+ls
+clear
+clear
+cat test_history.txt  
+history -a test_history.txt  
+clear
+history
+clear
+ls
+celar
+exit
+ls
+clear
+echo new command
+exit
